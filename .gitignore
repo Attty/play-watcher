@@ -1,0 +1,8 @@
+# Local-only artifacts — not for the GitHub Actions repo
+*.log
+com.workspace.playwatcher.plist
+.DS_Store
+
+# state lives in the Actions cache, never in the public repo
+state.json
+# config has NO package list (the watch list is the WATCH_PACKAGES secret)

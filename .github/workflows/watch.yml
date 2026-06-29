@@ -1,0 +1,74 @@
+name: play-watcher
+
+# Continuous self-perpetuating chain (24/7) — does NOT depend on GitHub's flaky
+# cron. The watch list lives in a SECRET (WATCH_PACKAGES), state lives in the
+# Actions cache — neither is ever in the public repo, history or logs.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "loop (default) or test (send a Telegram test)"
+        default: "loop"
+        type: choice
+        options: [loop, test]
+  schedule:
+    - cron: "13 * * * *"   # hourly backup to revive the chain if it stops
+
+permissions:
+  contents: read
+
+concurrency:
+  group: play-watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Runner public IP
+        run: echo "RUNNER_PUBLIC_IP=$(curl -s https://api.ipify.org)"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore watcher state
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.mode == 'test') }}
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: watcher-state-${{ github.run_id }}
+          restore-keys: watcher-state-
+
+      - name: Test message (manual mode=test only)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'test' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python watch.py --test-telegram
+
+      - name: Watcher bot (~5.5h — instant commands + Play check every 5 min)
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.mode == 'test') }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WATCH_PACKAGES: ${{ secrets.WATCH_PACKAGES }}
+          LOOP_MAX_SECONDS: "19800"
+        run: python watch.py --bot
+
+      - name: Save watcher state
+        if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.mode == 'test') }}
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: watcher-state-${{ github.run_id }}
+
+      - name: Re-dispatch self (keep the chain alive)
+        if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.mode == 'test') }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.DISPATCH_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/Attty/play-watcher/actions/workflows/watch.yml/dispatches \
+            -d '{"ref":"main"}' -o /dev/null -w "re-dispatch HTTP %{http_code}\n"

@@ -1,0 +1,8 @@
+{
+  "telegram": {
+    "bot_token": "",
+    "chat_id": ""
+  },
+  "interval_seconds": 300,
+  "packages": []
+}
