@@ -26,8 +26,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
-      - name: Runner public IP
-        run: echo "RUNNER_PUBLIC_IP=$(curl -s https://api.ipify.org)"
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
