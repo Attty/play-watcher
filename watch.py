@@ -16,6 +16,7 @@ Usage:
 """
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -279,9 +280,87 @@ def listing_state(code, html):
     return live, token
 
 
+def jira_creds():
+    email = os.environ.get("JIRA_EMAIL", "").strip()
+    token = os.environ.get("JIRA_TOKEN", "").strip()
+    base = os.environ.get("JIRA_BASE", "https://crash-apps-main.atlassian.net").strip().rstrip("/")
+    return email, token, base
+
+
+def _jira_req(path, method="GET", data=None, timeout=30):
+    import base64
+    email, token, base = jira_creds()
+    if not email or not token:
+        return None
+    auth = base64.b64encode(("%s:%s" % (email, token)).encode()).decode()
+    req = urllib.request.Request(base + path, method=method)
+    req.add_header("Authorization", "Basic " + auth)
+    req.add_header("Accept", "application/json")
+    body = None
+    if data is not None:
+        body = json.dumps(data).encode()
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, body, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+            return json.loads(raw) if raw.strip() else {}
+    except Exception as e:  # noqa
+        log("Jira %s error: %s" % (method, e))
+        return None
+
+
+def jira_moderation_packages():
+    """Watch list built LIVE from Jira: every ticket in MODERATION status.
+    Add an app = move its ticket to MODERATION; remove = it leaves MODERATION
+    (done automatically on go-live in check_package). Returns None on error so
+    callers can fall back and never blank the list on a transient failure."""
+    q = urllib.parse.urlencode({
+        "jql": 'status = "MODERATION" ORDER BY key',
+        "fields": "summary,customfield_10145",
+        "maxResults": 100,
+    })
+    d = _jira_req("/rest/api/3/search/jql?" + q)
+    if not d or "issues" not in d:
+        return None
+    out = []
+    for i in d["issues"]:
+        f = i.get("fields", {})
+        bundle = f.get("customfield_10145")
+        if not bundle:
+            continue
+        m = re.search(r"\((.*?)\)", f.get("summary", ""))
+        name = (m.group(1) if m else "").strip()
+        key = i["key"]
+        out.append({
+            "id": bundle,
+            "label": ("%s %s" % (key, name)).strip(),
+            "kind": "warmup",
+            "jira_key": key,
+            "jira_url": "https://crash-apps-main.atlassian.net/browse/%s" % key,
+        })
+    return out
+
+
+def jira_advance_to_store(key):
+    """On first go-live, move the warmup ticket MODERATION → White App in Store
+    (transition id 121) so it drops out of the dynamic watch list. Best-effort;
+    logs no id/key to keep app identities out of the public Actions log."""
+    r = _jira_req("/rest/api/3/issue/%s/transitions" % key, "POST",
+                  {"transition": {"id": "121"}})
+    ok = r is not None
+    log("jira advance to White App in Store: %s" % ("ok" if ok else "FAILED"))
+    return ok
+
+
 def packages(cfg):
-    """Watch list comes from the WATCH_PACKAGES env (GitHub Secret, JSON) so the
-    app/package list is NEVER in the public repo. Falls back to config.json."""
+    """Watch list = Jira MODERATION tickets (dynamic) when JIRA_EMAIL/JIRA_TOKEN
+    are set. Falls back to the WATCH_PACKAGES env (JSON), then config.json — so a
+    transient Jira error never blanks the list."""
+    email, token, _ = jira_creds()
+    if email and token:
+        jp = jira_moderation_packages()
+        if jp is not None:
+            return jp
     raw = os.environ.get("WATCH_PACKAGES", "").strip()
     if raw:
         try:
@@ -340,9 +419,15 @@ def check_package(cfg, state, pkg):
                "Google Play url:\n%s\n"
                "Jira url:\n%s" % (head, token, st.get("baseline_date"), play, jira))
 
+    went_live = (not base_live) and live
     if msg and not already:
         st["alerted"] = True
         sent = telegram_send(cfg, state, msg)
+        # First go-live → advance the ticket out of MODERATION so it auto-drops
+        # from the dynamic watch list next cycle.
+        if went_live and pkg.get("jira_key") and not st.get("jira_advanced"):
+            if jira_advance_to_store(pkg["jira_key"]):
+                st["jira_advanced"] = True
         return "alert" if sent else "alert_failed"
     return "live" if live else "pending"
 
