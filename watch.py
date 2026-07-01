@@ -280,94 +280,67 @@ def listing_state(code, html):
     return live, token
 
 
-def jira_creds():
-    email = os.environ.get("JIRA_EMAIL", "").strip()
-    token = os.environ.get("JIRA_TOKEN", "").strip()
-    base = os.environ.get("JIRA_BASE", "https://crash-apps-main.atlassian.net").strip().rstrip("/")
-    return email, token, base
-
-
-def _jira_req(path, method="GET", data=None, timeout=30):
-    import base64
-    email, token, base = jira_creds()
-    if not email or not token:
-        return None
-    auth = base64.b64encode(("%s:%s" % (email, token)).encode()).decode()
-    req = urllib.request.Request(base + path, method=method)
-    req.add_header("Authorization", "Basic " + auth)
-    req.add_header("Accept", "application/json")
-    body = None
-    if data is not None:
-        body = json.dumps(data).encode()
-        req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, body, timeout=timeout) as r:
-            raw = r.read().decode("utf-8", "replace")
-            return json.loads(raw) if raw.strip() else {}
-    except Exception as e:  # noqa
-        log("Jira %s error: %s" % (method, e))
-        return None
-
-
-def jira_moderation_packages():
-    """Watch list built LIVE from Jira: every ticket in MODERATION status.
-    Add an app = move its ticket to MODERATION; remove = it leaves MODERATION
-    (done automatically on go-live in check_package). Returns None on error so
-    callers can fall back and never blank the list on a transient failure."""
-    q = urllib.parse.urlencode({
-        "jql": 'status = "MODERATION" ORDER BY key',
-        "fields": "summary,customfield_10145",
-        "maxResults": 100,
-    })
-    d = _jira_req("/rest/api/3/search/jql?" + q)
-    if not d or "issues" not in d:
-        return None
-    out = []
-    for i in d["issues"]:
-        f = i.get("fields", {})
-        bundle = f.get("customfield_10145")
-        if not bundle:
-            continue
-        m = re.search(r"\((.*?)\)", f.get("summary", ""))
-        name = (m.group(1) if m else "").strip()
-        key = i["key"]
-        out.append({
-            "id": bundle,
-            "label": ("%s %s" % (key, name)).strip(),
-            "kind": "warmup",
-            "jira_key": key,
-            "jira_url": "https://crash-apps-main.atlassian.net/browse/%s" % key,
-        })
-    return out
-
-
-def jira_advance_to_store(key):
-    """On first go-live, move the warmup ticket MODERATION → White App in Store
-    (transition id 121) so it drops out of the dynamic watch list. Best-effort;
-    logs no id/key to keep app identities out of the public Actions log."""
-    r = _jira_req("/rest/api/3/issue/%s/transitions" % key, "POST",
-                  {"transition": {"id": "121"}})
-    ok = r is not None
-    log("jira advance to White App in Store: %s" % ("ok" if ok else "FAILED"))
-    return ok
-
-
 def packages(cfg):
-    """Watch list = Jira MODERATION tickets (dynamic) when JIRA_EMAIL/JIRA_TOKEN
-    are set. Falls back to the WATCH_PACKAGES env (JSON), then config.json — so a
-    transient Jira error never blanks the list."""
-    email, token, _ = jira_creds()
-    if email and token:
-        jp = jira_moderation_packages()
-        if jp is not None:
-            return jp
+    """Watch list comes from the WATCH_PACKAGES env (GitHub Secret, JSON) so the
+    app/package list is NEVER in the public repo. Falls back to config.json.
+    Apps already marked done (dropped after go-live) are filtered out."""
     raw = os.environ.get("WATCH_PACKAGES", "").strip()
+    lst = None
     if raw:
         try:
-            return json.loads(raw)
+            lst = json.loads(raw)
         except ValueError:
             log("WATCH_PACKAGES is not valid JSON — falling back to config.json")
-    return cfg.get("packages", [])
+    if lst is None:
+        lst = cfg.get("packages", [])
+    return lst
+
+
+def remove_from_watchlist(pid):
+    """On go-live, drop this package from the WATCH_PACKAGES secret via the GitHub
+    API, so it stops being tracked (auto-cleanup). Uses the token already present
+    for re-dispatch (GH_SECRETS_TOKEN) — NO Jira creds involved. Best-effort:
+    no-ops locally / if PyNaCl or the token is missing."""
+    token = os.environ.get("GH_SECRETS_TOKEN", "").strip()
+    repo = os.environ.get("GH_REPO", "").strip()
+    raw = os.environ.get("WATCH_PACKAGES", "").strip()
+    if not token or not repo or not raw:
+        return False
+    try:
+        lst = json.loads(raw)
+    except ValueError:
+        return False
+    new = [p for p in lst if p.get("id") != pid]
+    if len(new) == len(lst):
+        return False  # wasn't in the secret list
+    try:
+        import base64
+        from nacl import encoding, public  # present on the Actions runner
+    except Exception:  # noqa
+        return False
+
+    def gh(path, method="GET", data=None):
+        req = urllib.request.Request("https://api.github.com/repos/%s%s" % (repo, path), method=method)
+        req.add_header("Authorization", "token " + token)
+        req.add_header("Accept", "application/vnd.github+json")
+        body = json.dumps(data).encode() if data is not None else None
+        if body:
+            req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, body, timeout=30) as r:
+            out = r.read().decode("utf-8", "replace")
+            return json.loads(out) if out.strip() else {}
+
+    try:
+        pk = gh("/actions/secrets/public-key")
+        box = public.SealedBox(public.PublicKey(pk["key"].encode(), encoding.Base64Encoder()))
+        sealed = box.encrypt(json.dumps(new, ensure_ascii=False).encode())
+        gh("/actions/secrets/WATCH_PACKAGES", "PUT",
+           {"encrypted_value": base64.b64encode(sealed).decode(), "key_id": pk["key_id"]})
+        log("dropped a package from the watch list on go-live (%d left)" % len(new))
+        return True
+    except Exception as e:  # noqa
+        log("watch-list removal failed: %s" % e)
+        return False
 
 
 def check_package(cfg, state, pkg):
@@ -423,11 +396,11 @@ def check_package(cfg, state, pkg):
     if msg and not already:
         st["alerted"] = True
         sent = telegram_send(cfg, state, msg)
-        # First go-live → advance the ticket out of MODERATION so it auto-drops
-        # from the dynamic watch list next cycle.
-        if went_live and pkg.get("jira_key") and not st.get("jira_advanced"):
-            if jira_advance_to_store(pkg["jira_key"]):
-                st["jira_advanced"] = True
+        # First go-live → drop it from the WATCH_PACKAGES secret so it stops being
+        # tracked (auto-cleanup via the re-dispatch token — no Jira creds).
+        if went_live and not st.get("dropped"):
+            if remove_from_watchlist(pid):
+                st["dropped"] = True
         return "alert" if sent else "alert_failed"
     return "live" if live else "pending"
 

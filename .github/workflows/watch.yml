@@ -52,10 +52,12 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           WATCH_PACKAGES: ${{ secrets.WATCH_PACKAGES }}
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+          GH_SECRETS_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           LOOP_MAX_SECONDS: "19800"
-        run: python watch.py --bot
+        run: |
+          pip install --quiet pynacl
+          python watch.py --bot
 
       - name: Save watcher state
         if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.mode == 'test') }}
